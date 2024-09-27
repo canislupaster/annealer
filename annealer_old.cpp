@@ -249,7 +249,7 @@ namespace old {
 			random_device rd;
 			unsigned seed = rd();
 
-			settings s = {.max_iter = 4000, .T_0 = 100.0, .temp_scheduler = make_geometric_scheduler(0.999), .seed = seed};
+			settings s = {.max_iter = 10000, .T_0 = 100.0, .temp_scheduler = make_geometric_scheduler(0.999), .seed = seed};
 
 			vector<result> results = multithreaded_sim_anneal(Q, s, 4, 4);
 			result best = results[0];

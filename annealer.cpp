@@ -1,10 +1,13 @@
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <iostream>
+#include <fstream>
 #include <concepts>
 #include <limits>
 #include <mutex>
 #include <ostream>
+#include <stdexcept>
 #include <vector>
 #include <random>
 #include <thread>
@@ -18,11 +21,6 @@
 #include "parser.hh"
 
 using namespace std;
-
-template<class T>
-concept Scheduler = requires(T a, double T_0, size_t iter, size_t max_iter) {
-	{a(T_0,iter,max_iter)}->std::convertible_to<double>;
-};
 
 void make_triangular(vector<vector<double>>& mat) {
 	for (int i=0; i<mat.size(); i++) {
@@ -93,101 +91,70 @@ struct QUBO {
 };
 
 struct Settings {
-	size_t max_iter, nthread, synchronize_interval, stop_threshold;
-	double T_0;
+	int max_iter, nthread, synchronize_interval, stop_threshold;
+	float T_0, alpha;
 	unsigned seed;
 };
 
-ostream& operator << (ostream& os, const vector<bool>& x) {
+ostream& operator<<(ostream& os, const vector<bool>& x) {
 	for (auto xi : x) os << xi << ' ';
 	return os;
 }
+
+struct Pool {
+	vector<thread> threads;
+	barrier<> done;
+	function<void(int)> f;
+	atomic<int> left;
+	bool ex=false;
+
+	Pool(int nthread=thread::hardware_concurrency()-1): done(nthread+1) {
+		while (nthread--) threads.emplace_back([&](){
+			while (true) {
+				done.arrive_and_wait();
+				if (ex) return;
+				int ti = left.fetch_sub(1);
+				if (ti>0 && f) f(ti-1);
+				done.arrive_and_wait();
+			}
+		});
+	}
+
+	void launch(function<void(int)> nf, int nthread) {
+		if (f) throw runtime_error("pool in use");
+		if (nthread>threads.size()) throw runtime_error("can't launch that many threads");
+		f=nf, left.store(nthread);
+		done.arrive_and_wait();
+	}
+
+	void join() {
+		done.arrive_and_wait();
+		f=function<void(int)>();
+	}
+
+	~Pool() {
+		if (f) done.arrive_and_wait();
+		ex=true;
+		done.arrive_and_wait();
+		for (auto& t: threads) t.join();
+	}
+};
 
 struct State {
 	vector<bool> solution;
 	QUBO const& qubo;
 	Settings const& set;
 
-	template<Scheduler S>
-	void anneal(S s) {
+	void anneal(Pool& pool) {
 		minstd_rand gen(set.seed);
 		uniform_int_distribution<> rand_bool(0,1);
 
-		solution.resize(qubo.n);
-		for (int i=0; i<qubo.n; i++) solution[i]=rand_bool(gen);
+		vector<bool> tmp(qubo.n);
+		for (int i=0; i<qubo.n; i++) tmp[i]=rand_bool(gen);
 		
-		vector<thread> thrds;
-
-		mutex lock;
-		double energy=0, t=set.T_0;
-		size_t stop=set.stop_threshold;
-		size_t i=0, until_step=set.nthread+1;
-
-		auto run = [&](int thread_i){
-			auto thread_gen = minstd_rand(set.seed^thread_i);
-			double thread_energy=numeric_limits<double>::infinity();
-			uniform_int_distribution flip_dis(0, qubo.n-1);
-			uniform_real_distribution dis;
-
-			vector<bool> sol=solution;
-			double thread_t=t;
-			int nxt_sync = set.synchronize_interval;
-
-			while (true) {
-				if (--nxt_sync == 0) {
-					nxt_sync=set.synchronize_interval;
-
-					lock_guard guard(lock);
-
-					if (--until_step==0) {
-						until_step=set.nthread;
-						t=s(set.T_0, ++i, set.max_iter);
-					}
-
-					if (i>=set.max_iter || stop==0) break;
-					thread_t=t;
-
-					if (dis(thread_gen) < exp((energy-thread_energy)/t)) {
-						energy=thread_energy;
-						solution=sol;
-						stop=set.stop_threshold;
-					} else {
-						thread_energy=energy;
-						sol=solution;
-						if (--stop==0) break;
-					}
-				}
-
-				int bit = flip_dis(thread_gen);
-				double d = qubo.diff(bit,sol);
-				if (dis(thread_gen) < exp(-d/thread_t)) {
-					sol[bit]=!sol[bit];
-					thread_energy+=d;
-				}
-			}
-		};
-
-		for (int i=0; i<set.nthread; i++) {
-			thrds.emplace_back(run, i);
-		}
-
-		run(set.nthread);
-		for (auto& t: thrds) t.join();
-	}
-
-	template<Scheduler S>
-	void anneal2(S s) {
-		minstd_rand gen(set.seed);
-		uniform_int_distribution<> rand_bool(0,1);
-
-		solution.resize(qubo.n);
-		for (int i=0; i<qubo.n; i++) solution[i]=rand_bool(gen);
-		
-		vector<thread> thrds;
-
-		atomic<size_t> thd;
+		atomic<int> thd;
 		float energy=0, t=set.T_0;
-		size_t i=0;
+		int i=0;
 
 		vector<float> diag_float(qubo.diag.begin(), qubo.diag.end());
 		vector<int> adj_i;
@@ -203,13 +170,19 @@ struct State {
 
 		adj_i.push_back(adj_j.size());
 
+		int stop=set.stop_threshold;
+		bool ex=false;
+
+		float best=0;
+		solution=tmp;
+
 		auto run = [
-				set=set, n=qubo.n,
+				&set=set, n=qubo.n,
 				diag=diag_float.data(), adj_i=adj_i.data(),
 				adj_j=adj_j.data(), adj_d=adj_float_d.data(),
-				sol=solution, &thd,&t,&s,
-				&i,&energy,&solution=solution
-			] (int thread_i) mutable {
+				&thd,&t,&ex,&best,
+				&i,&energy,&stop,&tmp=tmp,&solution=solution
+			] (int thread_i) {
 
 			auto thread_gen = minstd_rand(set.seed^thread_i);
 			uniform_int_distribution flip_dis(0, n-1);
@@ -218,27 +191,42 @@ struct State {
 			float thread_temp_mul = uniform_real_distribution<float>(0.1,10)(thread_gen);
 			float thread_t=set.T_0*thread_temp_mul;
 			float thread_energy=0;
+			vector<bool> sol=tmp;
 
 			int nxt_sync = set.synchronize_interval;
-			size_t nxt_thd = thread_i==set.nthread ? 0 : thread_i+1;
+			int nxt_thd = thread_i==set.nthread ? 0 : thread_i+1;
 
 			while (true) {
 				if (--nxt_sync==0) {
 					nxt_sync = set.synchronize_interval;
 
 					if (thd.load(memory_order_acquire)==thread_i) {
-						if (dis(thread_gen) < expf((energy-thread_energy)/t)) {
-							energy=thread_energy;
+						if (thread_energy<best) {
+							best=thread_energy;
 							solution=sol;
+							if (--stop<=0) ex=true;
 						} else {
-							thread_energy=energy;
-							sol=solution;
+							stop=set.stop_threshold;
 						}
 
-						thd.store(nxt_thd, memory_order_release);
-						if (i>=set.max_iter) break;
-						t=s(set.T_0, ++i, set.max_iter);
+						if (ex) {
+							thd.store(nxt_thd, memory_order_release);
+							break;
+						}
+
+						if (dis(thread_gen) < expf((energy-thread_energy)/t)) {
+							energy=thread_energy;
+							tmp=sol;
+						} else {
+							thread_energy=energy;
+							sol=tmp;
+						}
+
+						if (++i>=set.max_iter) ex=true;
+						t*=set.alpha;
 						thread_t=t*thread_temp_mul;
+
+						thd.store(nxt_thd, memory_order_release);
 					}
 				}
 
@@ -255,12 +243,9 @@ struct State {
 			}
 		};
 
-		for (int i=0; i<set.nthread; i++) {
-			thrds.emplace_back(run, i);
-		}
-
+		pool.launch(run, set.nthread);
 		run(set.nthread);
-		for (auto& t: thrds) t.join();
+		pool.join();
 	}
 
 	double val() {
@@ -270,18 +255,6 @@ struct State {
 		return x;
 	}
 };
-
-double linear_scheduler(double T_0, int iter, int max_iter) {
-	return T_0 - (T_0 / max_iter) * iter;
-}
-
-Scheduler auto make_geometric_scheduler(double beta) {
-	double alpha=1-beta;
-	return [alpha, v=double(0), init=false](double T_0, int iter, int max_iter) mutable {
-		if (!init) v=T_0, init=true;
-		return v*=alpha;
-	};
-}
 
 string format_time(double nanos) {
 	if (nanos<1e3) return format("{:.3f} ns", nanos);
@@ -312,6 +285,22 @@ struct BenchmarkResult {
 		}
 
 		return os;
+	}
+
+	void plot(ostream& os) {
+		os<<"set boxwidth 0.5"<<endl;
+		os<<"set style fill solid"<<endl;
+		os<<"set term pdfcairo"<<endl;
+		os<<"set output \"./bench.pdf\""<<endl;
+		os<<"set yrange [0:]"<<endl;
+		os<<"set xrange [0:]"<<endl;
+		os<<"plot '-' using 1 bins binwidth=10000000 notitle with boxes"<<endl;
+
+		for (size_t i=0; i<nanos.size(); i++) {
+			os<<nanos[i]<<endl;
+		}
+
+		os<<"e"<<endl;
 	}
 };
 
@@ -363,46 +352,39 @@ int main() {
 
 	// make_triangular(x);
 
+	pair<array<int, 2>, double> rnd_qubo;
 	auto parsed = parse_qubo(read_file("qubo.txt"));
 
 	random_device rd;
+	Pool p;
 	Settings s = {
 		.max_iter = 1000,
-		.nthread=std::thread::hardware_concurrency()-1,
+		.nthread=int(p.threads.size()),
 		.synchronize_interval=20,
-		.stop_threshold=100,
-		.T_0 = 100.0,
+		.stop_threshold=50,
+		.T_0 = 100.0, .alpha=1-1e-2,
 		.seed = rd()
 	};
 
-	auto mine = bench(1000, [v,&parsed,&s](){
+	auto mine2 = bench(1000, [v,&parsed,&s,&p](){
 		State state {.qubo=QUBO(vector(parsed)), .set=s};
-		state.anneal(make_geometric_scheduler(1e-2));
+		state.anneal(p);
 
 		if (abs(state.val()-v)>1e-3) {
-			cerr<<"WA (mine), got "<<state.val()<<endl;
+			cerr<<"WA, got "<<state.val()<<endl;
 		}
 	});
 
-	cout<<"mine:"<<endl<<mine<<endl;
+	cout<<"mine"<<endl<<mine2<<endl;
+	ofstream plot("./plot.gp");
+	mine2.plot(plot);
 
-	auto mine2 = bench(1000, [v,&parsed,&s](){
-		State state {.qubo=QUBO(vector(parsed)), .set=s};
-		state.anneal2(make_geometric_scheduler(1e-2));
+	// auto ishan = bench(200, [v,&parsed,&p](){
+	// 	double x = old::solve(parsed);
+	// 	if (abs(x-v)>1e-3) cerr<<"WA (ishan), got "<<x<<endl;
+	// });
 
-		if (abs(state.val()-v)>1e-3) {
-			cerr<<"WA (v2), got "<<state.val()<<endl;
-		}
-	});
-
-	cout<<"mine (2):"<<endl<<mine2<<endl;
-
-	auto ishan = bench(200, [v,&parsed](){
-		double x = old::solve(parsed);
-		if (abs(x-v)>1e-3) cerr<<"WA (ishan), got "<<x<<endl;
-	});
-
-	cout<<"ishan:"<<endl<<ishan<<endl;
+	// cout<<"ishan:"<<endl<<ishan<<endl;
 
 	// cout << "Energy: " << state.val() << endl;
 	// cout << "Solution: " << state.solution << endl;
