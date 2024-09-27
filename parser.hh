@@ -6,7 +6,7 @@
 
 using namespace std;
 
-map<pair<int, int>, double> parse_qubo(const string& input);
+vector<pair<array<int, 2>, double>> parse_qubo(const string& input);
 string read_file(const string& filename);
 
 #endif

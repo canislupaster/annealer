@@ -1,0 +1,3 @@
+-Wall
+-pthread
+-std=c++23

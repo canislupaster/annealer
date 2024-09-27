@@ -1,30 +1,35 @@
 # Makefile for C++ project
 
 # Compiler settings
-CXX = g++
-CXXFLAGS = -std=c++17 -Wall -pthread
+CXX = clang++
+CXXFLAGS = -std=c++23 -Wall -pthread -g
 
 # Source files
-SRCS = annealer.cpp parser.cpp
-HEADERS = parser.hh
+SRCS = annealer.cpp parser.cpp annealer_old.cpp
+HEADERS = parser.hh annealer_old.hpp
 
 # Executable name
+BUILD = build
 TARGET = annealer
 
 # Default target
-all: $(TARGET)
+all: $(TARGET)-fast
 
 # Rule to create the executable
-$(TARGET): $(SRCS) $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o $@ $(SRCS)
+$(BUILD)/$(TARGET)-fast: $(SRCS) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ $(SRCS) -Ofast
+
+# Rule to create the executable
+$(BUILD)/$(TARGET)-debug: $(SRCS) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ $(SRCS) -O0 -fsanitize=address
 
 # Run the program
-run: $(TARGET)
-	./$(TARGET)
+run: $(BUILD)/$(TARGET)-fast
+	./$(BUILD)/$(TARGET)-fast
 
 # Clean up generated files
 clean:
-	rm -f $(TARGET)
+	rm -f $(BUILD)/$(TARGET)-*
 
 # Phony targets
 .PHONY: all clean run
