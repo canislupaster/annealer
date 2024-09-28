@@ -4,6 +4,7 @@
 #include <iostream>
 #include <fstream>
 #include <concepts>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <ostream>
@@ -91,9 +92,18 @@ struct QUBO {
 };
 
 struct Settings {
-	int max_iter, nthread, synchronize_interval, stop_threshold;
+	int max_iter, nthread, synchronize_interval;
+	int stop_threshold, restart_threshold;
 	float T_0, alpha;
 	unsigned seed;
+
+	//print settings
+	friend ostream& operator<<(ostream& os, Settings const& s) {
+		return os<<format(
+			"max_iter={}, nthread={}, synchronize_interval={}, stop_threshold={}, restart_threshold={}, T_0={}, alpha={}, seed={}",
+			s.max_iter, s.nthread, s.synchronize_interval, s.stop_threshold, s.restart_threshold, s.T_0, s.alpha, s.seed
+		);
+	}
 };
 
 ostream& operator<<(ostream& os, const vector<bool>& x) {
@@ -248,6 +258,120 @@ struct State {
 		pool.join();
 	}
 
+	void anneal2(Pool& pool, optional<atomic<int>> total_its=nullopt) {
+		minstd_rand gen(set.seed);
+		uniform_int_distribution<> rand_bool(0,1);
+
+		vector<bool> tmp(qubo.n);
+		for (int i=0; i<qubo.n; i++) tmp[i]=rand_bool(gen);
+		
+		atomic<int> thd;
+		float energy=0, t=set.T_0;
+		int i=0;
+
+		vector<float> diag_float(qubo.diag.begin(), qubo.diag.end());
+		vector<int> adj_i;
+		vector<int> adj_j;
+		vector<double> adj_float_d;
+		for (int i=0; i<qubo.n; i++) {
+			adj_i.push_back(adj_j.size());
+			for (auto [a,b]: qubo.adj[i]) {
+				adj_j.push_back(a);
+				adj_float_d.push_back(b);
+			}
+		}
+
+		adj_i.push_back(adj_j.size());
+
+		int stop=set.stop_threshold, restart=set.restart_threshold;
+		bool ex=false;
+
+		float best=0;
+		solution=tmp;
+
+		auto run = [
+				&set=set, n=qubo.n,
+				diag=diag_float.data(), adj_i=adj_i.data(),
+				adj_j=adj_j.data(), adj_d=adj_float_d.data(),
+				&thd,&t,&ex,&best,&restart,&total_its,
+				&i,&energy,&stop,&tmp=tmp,&solution=solution
+			] (int thread_i) {
+
+			auto thread_gen = minstd_rand(set.seed^thread_i);
+			uniform_int_distribution flip_dis(0, n-1);
+			uniform_real_distribution<float> dis;
+
+			float thread_temp_mul = uniform_real_distribution<float>(0.1,10)(thread_gen);
+			float thread_t=set.T_0*thread_temp_mul;
+			float thread_energy=0;
+			vector<bool> sol=tmp;
+
+			int nxt_sync = set.synchronize_interval;
+			int nxt_thd = thread_i==set.nthread ? 0 : thread_i+1;
+
+			while (true) {
+				if (--nxt_sync==0) {
+					nxt_sync = set.synchronize_interval;
+
+					if (thd.load(memory_order_acquire)==thread_i) {
+						if (thread_energy<best) {
+							best=thread_energy;
+							solution=sol;
+							if (--stop<=0) ex=true;
+						} else {
+							stop=set.stop_threshold;
+						}
+
+						if (ex) {
+							thd.store(nxt_thd, memory_order_release);
+							break;
+						}
+
+						if (dis(thread_gen) < expf((energy-thread_energy)/t)) {
+							energy=thread_energy;
+							tmp=sol;
+
+							restart=set.restart_threshold;
+						} else {
+							thread_energy=energy;
+							sol=tmp;
+
+							if (--restart<=0) {
+								t=sqrtf(set.T_0*t);
+								// t=set.T_0;
+								thread_temp_mul = uniform_real_distribution<float>(0.1,10)(thread_gen);
+								restart=set.restart_threshold;
+							}
+						}
+
+						if (++i>=set.max_iter) ex=true;
+						t*=set.alpha;
+						thread_t=t*thread_temp_mul;
+
+						thd.store(nxt_thd, memory_order_release);
+					}
+				}
+
+				int bit = flip_dis(thread_gen);
+				float d=diag[bit];
+				for (int i=adj_i[bit]; i<adj_i[bit+1]; i++)
+					if (sol[adj_j[i]]) d+=adj_d[i];
+				if (sol[bit]) d=-d;
+				
+				if (dis(thread_gen) < expf(-d/thread_t)) {
+					sol[bit]=!sol[bit];
+					thread_energy+=d;
+				}
+
+				if (total_its) total_its->operator++();
+			}
+		};
+
+		pool.launch(run, set.nthread);
+		run(set.nthread);
+		pool.join();
+	}
+
 	double val() {
 		double x=0;
 		for (auto [a,b]: qubo.entries)
@@ -304,18 +428,23 @@ struct BenchmarkResult {
 	}
 };
 
-BenchmarkResult bench(int n, function<void()> f) {
-	vector<size_t> res;
+vector<BenchmarkResult> bench(int n, initializer_list<function<void()>> fs) {
+	vector<vector<size_t>> res(fs.size());
 
 	while (n--) {
-		auto s = chrono::high_resolution_clock::now();
-		f();
-		auto e = chrono::high_resolution_clock::now();
-		size_t ns = duration_cast<chrono::nanoseconds>(e-s).count();
-		res.push_back(ns);
+		for (int i=0; i<fs.size(); i++) {
+			auto& f = *(fs.begin()+i);
+			auto s = chrono::high_resolution_clock::now();
+			f();
+			auto e = chrono::high_resolution_clock::now();
+			size_t ns = duration_cast<chrono::nanoseconds>(e-s).count();
+			res[i].push_back(ns);
+		}
 	}
 
-	return BenchmarkResult(std::move(res));
+	vector<BenchmarkResult> out;
+	for (auto& x: res) out.emplace_back(std::move(x));
+	return out;
 }
 
 size_t simple_search(size_t l, size_t orig_r, function<bool(size_t)> f, size_t threshold=100) {
@@ -339,8 +468,68 @@ size_t simple_search(size_t l, size_t orig_r, function<bool(size_t)> f, size_t t
 	return l;
 }
 
+struct Parameter {
+	int lo, hi, val;
+	Parameter(int lo_, int hi_, optional<int> val_=nullopt): lo(lo_), hi(hi_), val(val_ ? *val_ : (lo_+hi_)/2) {}
+};
+
+struct OptSettings {
+	int iter=400;
+	double step=1;
+	double threshold=0.1;
+	double alpha=0.992;
+	double parm_slope_alpha=0.9;
+	int warmup=100;
+	int seed=random_device{}();
+};
+
+//garbage optimizer lmao
+void optimize(vector<Parameter>& params, function<double(vector<Parameter> const&)> f, OptSettings const& set=OptSettings()) {
+	minstd_rand rng(set.seed);
+
+	double step=set.step;
+	vector<double> parm_slope(params.size(),0);
+
+	double cur = f(params);
+
+	for (int it=0; it<set.iter; it++) {
+		cout<<"optimize it="<<it<<endl;
+
+		int i=uniform_int_distribution<>(0,params.size()-1)(rng);
+
+		int v2;
+		do {
+			v2 = uniform_int_distribution<>(params[i].lo,params[i].hi)(rng);
+		} while (v2==params[i].val);
+
+		swap(params[i].val,v2);
+		double other=f(params);
+		swap(params[i].val,v2);
+
+		if (abs(other-cur)>1e-3) {
+			double newslope = (other-cur)/double(v2-params[i].val);
+
+			double d = double(params[i].val-v2)/(step*(params[i].hi-params[i].lo));
+			double c = 1/(1+d*d);
+			parm_slope[i] = c*newslope + set.parm_slope_alpha*parm_slope[i];
+
+			if (abs(parm_slope[i])>set.threshold) {
+				double step_c = step*min(double(it+1)/set.warmup,1.0);
+				if (parm_slope[i]>0) params[i].val+=floor(step_c*(params[i].hi-params[i].val));
+				else params[i].val-=floor(step_c*(params[i].val-params[i].lo));
+
+				cur=f(params);
+			}
+
+			cout<<"slope of parameter "<<i<<" is "<<parm_slope[i]<<" (new "<<newslope<<")"<<endl;
+		}
+
+		step *= set.alpha;
+	}
+}
+
 int main() {
-	double v=-38.9281;
+	// double v=-38.9281;
 	// vector<vector<double>> x = {
 	// 	{-17, 10, 10, 10, 0, 20},
 	// 	{10, -18, 10, 10, 10, 20},
@@ -351,33 +540,99 @@ int main() {
 	// };
 
 	// make_triangular(x);
-
-	pair<array<int, 2>, double> rnd_qubo;
-	auto parsed = parse_qubo(read_file("qubo.txt"));
-
 	random_device rd;
+
+	vector<pair<array<int, 2>, double>> rnd_qubo;
+	int n=100;
+	mt19937 gen(123);
+	for (int i=0; i<n*20; i++) {
+		int r=uniform_int_distribution<>(0,n-1)(gen);
+		int c=uniform_int_distribution<>(0,n-1)(gen);
+		if (c>r) swap(r,c);
+
+		rnd_qubo.emplace_back(array<int,2>{r,c}, uniform_real_distribution<>(-10,10)(gen));
+	}
+
+	// auto parsed = parse_qubo(read_file("qubo.txt"));
+
 	Pool p;
-	Settings s = {
-		.max_iter = 1000,
+	Settings default_settings = {
+		.max_iter = 8000,
 		.nthread=int(p.threads.size()),
-		.synchronize_interval=20,
-		.stop_threshold=50,
-		.T_0 = 100.0, .alpha=1-1e-2,
+		.synchronize_interval=30,
+		.stop_threshold=2000, .restart_threshold=1000,
+		.T_0 = 100.0, .alpha=1-2e-3,
 		.seed = rd()
 	};
 
-	auto mine2 = bench(1000, [v,&parsed,&s,&p](){
-		State state {.qubo=QUBO(vector(parsed)), .set=s};
+	QUBO qubo = QUBO(vector(rnd_qubo));
+
+	State optimal {.qubo=qubo, .set=default_settings};
+	optimal.anneal(p);
+	double v = optimal.val();
+
+	vector<Parameter> parms = {
+		Parameter(1000,8000),
+		Parameter(5,35),
+		Parameter(100,8000),
+		Parameter(100,8000),
+		Parameter(10,1000),
+		Parameter(10,100)
+	};
+
+	auto parms_to_settings = [&]() {
+		return Settings {
+			.max_iter = parms[0].val,
+			.nthread=int(p.threads.size()),
+			.synchronize_interval=parms[1].val,
+			.stop_threshold=parms[2].val, .restart_threshold=parms[3].val,
+			.T_0 = float(parms[4].val), .alpha=1.0f-powf(10,-4*float(parms[5].val)/100),
+			.seed = rd()
+		};
+	};
+
+	auto parm_score = [&]() {
+		int diff=0;
+		Settings s = parms_to_settings();
+		for (int i=0; i<7; i++) {
+			State state {.qubo=qubo, .set=s};
+			state.anneal2(p);
+			for (int j=0; j<qubo.n; j++)
+				if (state.solution[j]!=optimal.solution[j]) diff++;
+		}
+
+		cout<<"current: "<<s<<", diff "<<diff<<endl;
+
+		return -diff*100.0/qubo.n - double(s.max_iter*s.synchronize_interval/1e3);
+	};
+
+	optimize(parms, [&](vector<Parameter> const& p){return parm_score();});
+
+	auto set = parms_to_settings();
+	cout<<set<<endl<<"testing"<<endl;
+
+	int w1=0, w2=0;
+	auto mark = bench(100, {[&](){
+		State state {.qubo=qubo, .set=set};
 		state.anneal(p);
 
-		if (abs(state.val()-v)>1e-3) {
-			cerr<<"WA, got "<<state.val()<<endl;
-		}
-	});
+		if (state.val()-v>1e-3) w1++;
+		else if (state.val()<v-1e-3) cout<<"this is terrible, everything is wrong"<<endl;
+	}, [&](){
+		State state {.qubo=qubo, .set=set};
+		state.anneal2(p);
 
-	cout<<"mine"<<endl<<mine2<<endl;
-	ofstream plot("./plot.gp");
-	mine2.plot(plot);
+		if (state.val()-v>1e-3) w2++;
+		else if (state.val()<v-1e-3) cout<<"this is terrible, everything is wrong"<<endl;
+	}});
+
+	cout<<"WA (1): "<<w1<<endl;
+	cout<<"WA (2): "<<w2<<endl;
+	cout<<"1: "<<mark[0]<<endl;
+	cout<<"2: "<<mark[1]<<endl;
+
+	// ofstream plot("./plot.gp");
+	// mine2.plot(plot);
 
 	// auto ishan = bench(200, [v,&parsed,&p](){
 	// 	double x = old::solve(parsed);
