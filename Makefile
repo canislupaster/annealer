@@ -13,11 +13,11 @@ BUILD = build
 TARGET = annealer
 
 # Default target
-all: $(TARGET)-fast
+all: $(BUILD)/$(TARGET)-fast
 
 # Rule to create the executable
 $(BUILD)/$(TARGET)-fast: $(SRCS) $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o $@ $(SRCS) -Ofast
+	$(CXX) $(CXXFLAGS) -o $@ $(SRCS) -Ofast -funroll-loops
 
 # Rule to create the executable
 $(BUILD)/$(TARGET)-debug: $(SRCS) $(HEADERS)

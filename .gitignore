@@ -4,4 +4,9 @@ a.out
 annealer
 qubo.txt
 parser.hh.gch
+.idea
 build
+plot.gp
+bench.pdf
+qubo.txt
+params.txt

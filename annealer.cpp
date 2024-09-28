@@ -1,24 +1,17 @@
 #include <atomic>
-#include <barrier>
 #include <chrono>
 #include <iostream>
-#include <fstream>
-#include <concepts>
-#include <iterator>
-#include <limits>
-#include <mutex>
 #include <ostream>
 #include <stdexcept>
 #include <vector>
 #include <random>
-#include <thread>
 #include <algorithm>
 #include <format>
 #include <functional>
 #include <ranges>
-#include <map>
 
 #include "annealer_old.hpp"
+#include "pool.hpp"
 #include "parser.hh"
 
 using namespace std;
@@ -69,7 +62,7 @@ struct QUBO {
 		return sparse;
 	}
 
-	QUBO(vector<vector<double>> dense): QUBO(dense_to_sparse(dense)) {}
+	QUBO(vector<vector<double>> const& dense): QUBO(dense_to_sparse(dense)) {}
 
 	vector<double> diag;
 	vector<vector<pair<int,double>>> adj;
@@ -94,14 +87,14 @@ struct QUBO {
 struct Settings {
 	int max_iter, nthread, synchronize_interval;
 	int stop_threshold, restart_threshold;
-	float T_0, alpha;
+	float T_0, restart_mul, alpha;
 	unsigned seed;
 
 	//print settings
 	friend ostream& operator<<(ostream& os, Settings const& s) {
 		return os<<format(
-			"max_iter={}, nthread={}, synchronize_interval={}, stop_threshold={}, restart_threshold={}, T_0={}, alpha={}, seed={}",
-			s.max_iter, s.nthread, s.synchronize_interval, s.stop_threshold, s.restart_threshold, s.T_0, s.alpha, s.seed
+			"max_iter={}, nthread={}, synchronize_interval={}, stop_threshold={}, restart_threshold={}, T_0={}, restart_mul={}, alpha={}, seed={}",
+			s.max_iter, s.nthread, s.synchronize_interval, s.stop_threshold, s.restart_threshold, s.T_0, s.restart_mul, s.alpha, s.seed
 		);
 	}
 };
@@ -110,45 +103,6 @@ ostream& operator<<(ostream& os, const vector<bool>& x) {
 	for (auto xi : x) os << xi << ' ';
 	return os;
 }
-
-struct Pool {
-	vector<thread> threads;
-	barrier<> done;
-	function<void(int)> f;
-	atomic<int> left;
-	bool ex=false;
-
-	Pool(int nthread=thread::hardware_concurrency()-1): done(nthread+1) {
-		while (nthread--) threads.emplace_back([&](){
-			while (true) {
-				done.arrive_and_wait();
-				if (ex) return;
-				int ti = left.fetch_sub(1);
-				if (ti>0 && f) f(ti-1);
-				done.arrive_and_wait();
-			}
-		});
-	}
-
-	void launch(function<void(int)> nf, int nthread) {
-		if (f) throw runtime_error("pool in use");
-		if (nthread>threads.size()) throw runtime_error("can't launch that many threads");
-		f=nf, left.store(nthread);
-		done.arrive_and_wait();
-	}
-
-	void join() {
-		done.arrive_and_wait();
-		f=function<void(int)>();
-	}
-
-	~Pool() {
-		if (f) done.arrive_and_wait();
-		ex=true;
-		done.arrive_and_wait();
-		for (auto& t: threads) t.join();
-	}
-};
 
 struct State {
 	vector<bool> solution;
@@ -159,110 +113,7 @@ struct State {
 		minstd_rand gen(set.seed);
 		uniform_int_distribution<> rand_bool(0,1);
 
-		vector<bool> tmp(qubo.n);
-		for (int i=0; i<qubo.n; i++) tmp[i]=rand_bool(gen);
-		
-		atomic<int> thd;
-		float energy=0, t=set.T_0;
-		int i=0;
-
-		vector<float> diag_float(qubo.diag.begin(), qubo.diag.end());
-		vector<int> adj_i;
-		vector<int> adj_j;
-		vector<double> adj_float_d;
-		for (int i=0; i<qubo.n; i++) {
-			adj_i.push_back(adj_j.size());
-			for (auto [a,b]: qubo.adj[i]) {
-				adj_j.push_back(a);
-				adj_float_d.push_back(b);
-			}
-		}
-
-		adj_i.push_back(adj_j.size());
-
-		int stop=set.stop_threshold;
-		bool ex=false;
-
-		float best=0;
-		solution=tmp;
-
-		auto run = [
-				&set=set, n=qubo.n,
-				diag=diag_float.data(), adj_i=adj_i.data(),
-				adj_j=adj_j.data(), adj_d=adj_float_d.data(),
-				&thd,&t,&ex,&best,
-				&i,&energy,&stop,&tmp=tmp,&solution=solution
-			] (int thread_i) {
-
-			auto thread_gen = minstd_rand(set.seed^thread_i);
-			uniform_int_distribution flip_dis(0, n-1);
-			uniform_real_distribution<float> dis;
-
-			float thread_temp_mul = uniform_real_distribution<float>(0.1,10)(thread_gen);
-			float thread_t=set.T_0*thread_temp_mul;
-			float thread_energy=0;
-			vector<bool> sol=tmp;
-
-			int nxt_sync = set.synchronize_interval;
-			int nxt_thd = thread_i==set.nthread ? 0 : thread_i+1;
-
-			while (true) {
-				if (--nxt_sync==0) {
-					nxt_sync = set.synchronize_interval;
-
-					if (thd.load(memory_order_acquire)==thread_i) {
-						if (thread_energy<best) {
-							best=thread_energy;
-							solution=sol;
-							if (--stop<=0) ex=true;
-						} else {
-							stop=set.stop_threshold;
-						}
-
-						if (ex) {
-							thd.store(nxt_thd, memory_order_release);
-							break;
-						}
-
-						if (dis(thread_gen) < expf((energy-thread_energy)/t)) {
-							energy=thread_energy;
-							tmp=sol;
-						} else {
-							thread_energy=energy;
-							sol=tmp;
-						}
-
-						if (++i>=set.max_iter) ex=true;
-						t*=set.alpha;
-						thread_t=t*thread_temp_mul;
-
-						thd.store(nxt_thd, memory_order_release);
-					}
-				}
-
-				int bit = flip_dis(thread_gen);
-				float d=diag[bit];
-				for (int i=adj_i[bit]; i<adj_i[bit+1]; i++)
-					if (sol[adj_j[i]]) d+=adj_d[i];
-				if (sol[bit]) d=-d;
-				
-				if (dis(thread_gen) < expf(-d/thread_t)) {
-					sol[bit]=!sol[bit];
-					thread_energy+=d;
-				}
-			}
-		};
-
-		pool.launch(run, set.nthread);
-		run(set.nthread);
-		pool.join();
-	}
-
-	void anneal2(Pool& pool, optional<atomic<int>> total_its=nullopt) {
-		minstd_rand gen(set.seed);
-		uniform_int_distribution<> rand_bool(0,1);
-
-		vector<bool> tmp(qubo.n);
+		vector<char> tmp(qubo.n,0);
 		for (int i=0; i<qubo.n; i++) tmp[i]=rand_bool(gen);
 		
 		atomic<int> thd;
@@ -287,14 +138,15 @@ struct State {
 		bool ex=false;
 
 		float best=0;
-		solution=tmp;
+		vector<char> out=tmp;
+		vector<char> orig=tmp;
 
 		auto run = [
 				&set=set, n=qubo.n,
 				diag=diag_float.data(), adj_i=adj_i.data(),
 				adj_j=adj_j.data(), adj_d=adj_float_d.data(),
-				&thd,&t,&ex,&best,&restart,&total_its,
-				&i,&energy,&stop,&tmp=tmp,&solution=solution
+				&thd,&t,&ex,&best,&restart,
+				&i,&energy,&stop,&tmp,&out,&orig
 			] (int thread_i) {
 
 			auto thread_gen = minstd_rand(set.seed^thread_i);
@@ -304,7 +156,7 @@ struct State {
 			float thread_temp_mul = uniform_real_distribution<float>(0.1,10)(thread_gen);
 			float thread_t=set.T_0*thread_temp_mul;
 			float thread_energy=0;
-			vector<bool> sol=tmp;
+			vector<char> sol=orig;
 
 			int nxt_sync = set.synchronize_interval;
 			int nxt_thd = thread_i==set.nthread ? 0 : thread_i+1;
@@ -315,11 +167,11 @@ struct State {
 
 					if (thd.load(memory_order_acquire)==thread_i) {
 						if (thread_energy<best) {
-							best=thread_energy;
-							solution=sol;
-							if (--stop<=0) ex=true;
-						} else {
+							best=thread_energy-1e-7;
+							out=sol;
 							stop=set.stop_threshold;
+						} else if (--stop<=0) {
+							ex=true;
 						}
 
 						if (ex) {
@@ -327,7 +179,8 @@ struct State {
 							break;
 						}
 
-						if (dis(thread_gen) < expf((energy-thread_energy)/t)) {
+						float d = (energy-thread_energy)/t;
+						if (d > -10 && (d>0 || dis(thread_gen) < 1.0/(d-1)/(d-1))) {
 							energy=thread_energy;
 							tmp=sol;
 
@@ -337,9 +190,8 @@ struct State {
 							sol=tmp;
 
 							if (--restart<=0) {
-								t=sqrtf(set.T_0*t);
-								// t=set.T_0;
-								thread_temp_mul = uniform_real_distribution<float>(0.1,10)(thread_gen);
+								// t=sqrtf(set.T_0*t);
+								t*=set.restart_mul;
 								restart=set.restart_threshold;
 							}
 						}
@@ -356,20 +208,21 @@ struct State {
 				float d=diag[bit];
 				for (int i=adj_i[bit]; i<adj_i[bit+1]; i++)
 					if (sol[adj_j[i]]) d+=adj_d[i];
-				if (sol[bit]) d=-d;
+				if (!sol[bit]) d=-d;
 				
-				if (dis(thread_gen) < expf(-d/thread_t)) {
+				d/=thread_t;
+				if (d > -10 && (d>0 || dis(thread_gen) < 1.0/(d-1)/(d-1))) {
 					sol[bit]=!sol[bit];
-					thread_energy+=d;
+					thread_energy-=d;
 				}
-
-				if (total_its) total_its->operator++();
 			}
 		};
 
 		pool.launch(run, set.nthread);
 		run(set.nthread);
 		pool.join();
+
+		solution.assign(tmp.begin(), tmp.end());
 	}
 
 	double val() {
@@ -400,7 +253,6 @@ struct BenchmarkResult {
 		dev = sqrt(dev);
 	}
 
-	// statistical summary functions: mean, median, quartiles, stddev
 	friend ostream& operator<<(ostream& os, BenchmarkResult const& bench) {
 		cout<<bench.nanos.size()<<" trials, "<<format_time(bench.mean)<<" mean, "<<format_time(bench.dev)<<" stddev"<<endl;
 		for (size_t i=0; i<=4; i++) {
@@ -474,12 +326,10 @@ struct Parameter {
 };
 
 struct OptSettings {
-	int iter=400;
-	double step=1;
-	double threshold=0.1;
-	double alpha=0.992;
-	double parm_slope_alpha=0.9;
-	int warmup=100;
+	int iter=50;
+	double alpha=0.93;
+	double alpha2=0.5;
+	double step=3;
 	int seed=random_device{}();
 };
 
@@ -488,43 +338,25 @@ void optimize(vector<Parameter>& params, function<double(vector<Parameter> const
 	minstd_rand rng(set.seed);
 
 	double step=set.step;
-	vector<double> parm_slope(params.size(),0);
-
-	double cur = f(params);
-
+	int n=params.size();
+	double cur = 0;
+	double nc=0;
 	for (int it=0; it<set.iter; it++) {
-		cout<<"optimize it="<<it<<endl;
+		cur*=nc, cur+=f(params), nc++, cur/=nc;
 
-		int i=uniform_int_distribution<>(0,params.size()-1)(rng);
-
-		int v2;
-		do {
-			v2 = uniform_int_distribution<>(params[i].lo,params[i].hi)(rng);
-		} while (v2==params[i].val);
-
-		swap(params[i].val,v2);
-		double other=f(params);
-		swap(params[i].val,v2);
-
-		if (abs(other-cur)>1e-3) {
-			double newslope = (other-cur)/double(v2-params[i].val);
-
-			double d = double(params[i].val-v2)/(step*(params[i].hi-params[i].lo));
-			double c = 1/(1+d*d);
-			parm_slope[i] = c*newslope + set.parm_slope_alpha*parm_slope[i];
-
-			if (abs(parm_slope[i])>set.threshold) {
-				double step_c = step*min(double(it+1)/set.warmup,1.0);
-				if (parm_slope[i]>0) params[i].val+=floor(step_c*(params[i].hi-params[i].val));
-				else params[i].val-=floor(step_c*(params[i].val-params[i].lo));
-
-				cur=f(params);
-			}
-
-			cout<<"slope of parameter "<<i<<" is "<<parm_slope[i]<<" (new "<<newslope<<")"<<endl;
+		normal_distribution<double> dist;
+		vector<int> old(n);
+		for (int i=0; i<n; i++) {
+			old[i]=params[i].val;
+			params[i].val=clamp(int(round(params[i].val+step*dist(rng)*(params[i].hi-params[i].lo))), params[i].lo,params[i].hi);
 		}
 
-		step *= set.alpha;
+		double v = f(params);
+		cout<<"opt "<<it<<": "<<v<<" vs "<<cur<<endl;
+		if (v<=1.2*cur) for (int i=0; i<n; i++) params[i].val=old[i];
+		else cur=set.alpha2*v + (1-set.alpha2)*cur, nc=set.alpha2 + (1-set.alpha2)*nc;
+
+		step*=set.alpha;
 	}
 }
 
@@ -553,83 +385,89 @@ int main() {
 		rnd_qubo.emplace_back(array<int,2>{r,c}, uniform_real_distribution<>(-10,10)(gen));
 	}
 
-	// auto parsed = parse_qubo(read_file("qubo.txt"));
+	auto parsed = parse_qubo(read_file("qubo.txt"));
 
 	Pool p;
 	Settings default_settings = {
-		.max_iter = 8000,
+		.max_iter = 2000,
 		.nthread=int(p.threads.size()),
-		.synchronize_interval=30,
-		.stop_threshold=2000, .restart_threshold=1000,
-		.T_0 = 100.0, .alpha=1-2e-3,
+		.synchronize_interval=10,
+		.stop_threshold=500, .restart_threshold=320,
+		.T_0 = 50.0, .restart_mul=2.3, .alpha=1-1e-2,
 		.seed = rd()
 	};
 
-	QUBO qubo = QUBO(vector(rnd_qubo));
+	QUBO qubo = QUBO(vector(parsed));
 
 	State optimal {.qubo=qubo, .set=default_settings};
 	optimal.anneal(p);
 	double v = optimal.val();
+	// cout<<"qubo: "<<qubo<<endl;
+	cout<<"v: "<<v<<endl;
+	cout<<"sol: "<<optimal.solution<<endl;
 
-	vector<Parameter> parms = {
-		Parameter(1000,8000),
-		Parameter(5,35),
-		Parameter(100,8000),
-		Parameter(100,8000),
-		Parameter(10,1000),
-		Parameter(10,100)
-	};
+	// vector<Parameter> parms = {
+	// 	Parameter(1000,8000),
+	// 	Parameter(5,35),
+	// 	Parameter(100,8000),
+	// 	Parameter(100,8000),
+	// 	Parameter(10,1000),
+	// 	Parameter(10,100)
+	// };
 
-	auto parms_to_settings = [&]() {
-		return Settings {
-			.max_iter = parms[0].val,
-			.nthread=int(p.threads.size()),
-			.synchronize_interval=parms[1].val,
-			.stop_threshold=parms[2].val, .restart_threshold=parms[3].val,
-			.T_0 = float(parms[4].val), .alpha=1.0f-powf(10,-4*float(parms[5].val)/100),
-			.seed = rd()
-		};
-	};
+	// auto parms_to_settings = [&]() {
+	// 	return Settings {
+	// 		.max_iter = parms[0].val,
+	// 		.nthread=int(p.threads.size()),
+	// 		.synchronize_interval=parms[1].val,
+	// 		.stop_threshold=parms[2].val, .restart_threshold=parms[3].val,
+	// 		.T_0 = float(parms[4].val), .alpha=1.0f-powf(10,-4*float(parms[5].val)/100),
+	// 		.seed = rd()
+	// 	};
+	// };
 
-	auto parm_score = [&]() {
-		int diff=0;
-		Settings s = parms_to_settings();
-		for (int i=0; i<7; i++) {
-			State state {.qubo=qubo, .set=s};
-			state.anneal2(p);
-			for (int j=0; j<qubo.n; j++)
-				if (state.solution[j]!=optimal.solution[j]) diff++;
-		}
+	// auto parm_score = [&]() {
+	// 	double diff=0;
+	// 	Settings s = parms_to_settings();
+	// 	atomic<int> total_its(0);
+	// 	for (int i=0; i<30; i++) {
+	// 		State state {.qubo=qubo, .set=s};
+	// 		state.anneal2(p, &total_its);
+	// 		double d=state.val()-optimal.val();
+	// 		diff=max(diff,d*d);
+	// 	}
 
-		cout<<"current: "<<s<<", diff "<<diff<<endl;
+	// 	cout<<"current: "<<s<<", diff "<<diff<<", its: "<<total_its.load()<<endl;
 
-		return -diff*100.0/qubo.n - double(s.max_iter*s.synchronize_interval/1e3);
-	};
+	// 	return -diff*100.0 - double(total_its.load()/1e6);
+	// };
 
-	optimize(parms, [&](vector<Parameter> const& p){return parm_score();});
+	// optimize(parms, [&](vector<Parameter> const& p){return parm_score();});
 
-	auto set = parms_to_settings();
+	// auto set = parms_to_settings();
+	auto set = default_settings;
 	cout<<set<<endl<<"testing"<<endl;
 
 	int w1=0, w2=0;
-	auto mark = bench(100, {[&](){
+	size_t my_its=0, ishan_its=0;
+	auto mark = bench(300, {[&](){
 		State state {.qubo=qubo, .set=set};
 		state.anneal(p);
 
 		if (state.val()-v>1e-3) w1++;
 		else if (state.val()<v-1e-3) cout<<"this is terrible, everything is wrong"<<endl;
-	}, [&](){
-		State state {.qubo=qubo, .set=set};
-		state.anneal2(p);
-
-		if (state.val()-v>1e-3) w2++;
-		else if (state.val()<v-1e-3) cout<<"this is terrible, everything is wrong"<<endl;
+	}, [&]() {
+		double val = old::solve(parsed, p);
+		if (val-v>1e-3) w2++;
+		else if (val<v-1e-3) cout<<"this is terrible, everything is wrong"<<endl;
 	}});
 
 	cout<<"WA (1): "<<w1<<endl;
 	cout<<"WA (2): "<<w2<<endl;
 	cout<<"1: "<<mark[0]<<endl;
 	cout<<"2: "<<mark[1]<<endl;
+
+	cout<<"my its: "<<my_its<<", ishan its: "<<ishan_its<<endl;
 
 	// ofstream plot("./plot.gp");
 	// mine2.plot(plot);

@@ -1,3 +1,4 @@
+#include "annealer_old.hpp"
 #include <iostream>
 #include <ostream>
 #include <vector>
@@ -8,10 +9,11 @@
 #include <map>
 
 #include "parser.hh"
+#include "pool.hpp"
+
+using namespace std;
 
 namespace old {
-	using namespace std;
-
 	using solution_t = vector<bool>;
 	using qubo_t = map<pair<int, int>, double>;
 	using scheduler_t = function<double(double T_0, double T, int iter, int max_iter)>;
@@ -33,6 +35,7 @@ namespace old {
 			double T_0;
 			scheduler_t temp_scheduler;
 			unsigned seed;
+			Pool& p;
 	};
 
 	struct result {
@@ -139,17 +142,16 @@ namespace old {
 			assert_lower_triangular(Q);
 			vector<thread> threads;
 			vector<result> results(num_threads * samples_per_thread);
-			for (int i = 0; i < num_threads; i++) {
-					threads.emplace_back([&results, i, &Q, s, samples_per_thread](){
-							for (int j = 0; j < samples_per_thread; j++) {
-									settings s_copy = s;
-									s_copy.seed += i * samples_per_thread + j;
-									results[i * samples_per_thread + j] = sim_anneal(Q, s_copy);
-							}
-					});
-			}
+			auto f = [&results, &Q, s, samples_per_thread](int i){
+					for (int j = 0; j < samples_per_thread; j++) {
+							settings s_copy = s;
+							s_copy.seed += i * samples_per_thread + j;
+							results[i * samples_per_thread + j] = sim_anneal(Q, s_copy);
+					}
+			};
 
-			for (auto& t : threads) t.join();
+			s.p.launch(f, num_threads);
+			s.p.join();
 
 			sort(results.begin(), results.end(), [](const result& a, const result& b) {
 					return a.energy < b.energy;
@@ -223,7 +225,7 @@ namespace old {
 	optimize evaluate by getting diff caused by flipping one bit
 	*/
 
-	double solve(vector<pair<array<int, 2>, double>> const& parsed) {
+	double solve(vector<pair<array<int, 2>, double>> const& parsed, Pool& p) {
 			// qubo_t Q = condense({
 			//     { -2,  1,  1,  0,  0 },
 			//     {  1, -2,  0,  1,  0 },
@@ -249,9 +251,9 @@ namespace old {
 			random_device rd;
 			unsigned seed = rd();
 
-			settings s = {.max_iter = 10000, .T_0 = 100.0, .temp_scheduler = make_geometric_scheduler(0.999), .seed = seed};
+			settings s = {.max_iter = 10000, .T_0 = 100.0, .temp_scheduler = make_geometric_scheduler(0.999), .seed = seed, .p=p};
 
-			vector<result> results = multithreaded_sim_anneal(Q, s, 4, 4);
+			vector<result> results = multithreaded_sim_anneal(Q, s, p.threads.size(), 1);
 			result best = results[0];
 
 			return best.energy;
