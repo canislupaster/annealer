@@ -34,16 +34,27 @@ struct QUBO {
 			n = max({n,x[0]+1,x[1]+1});
 		}
 
-		adj.resize(n), diag.resize(n);
+		diag_float.resize(n);
 
+		vector<vector<pair<int,double>>> adj(n);
 		for (auto [x,y]: entries) {
 			if (x[0]!=x[1]) {
 				adj[x[0]].emplace_back(x[1],y);
 				adj[x[1]].emplace_back(x[0],y);
 			} else {
-				diag[x[0]]=y;
+				diag_float[x[0]]=y;
 			}
 		}
+
+		for (int i=0; i<n; i++) {
+			adj_i.push_back(adj_j.size());
+			for (auto [a,b]: adj[i]) {
+				adj_j.push_back(a);
+				adj_float_d.push_back(b);
+			}
+		}
+
+		adj_i.push_back(adj_j.size());
 	}
 
 	static vector<pair<array<int,2>, double>> dense_to_sparse(vector<vector<double>> const& dense) {
@@ -64,8 +75,6 @@ struct QUBO {
 
 	QUBO(vector<vector<double>> const& dense): QUBO(dense_to_sparse(dense)) {}
 
-	vector<double> diag;
-	vector<vector<pair<int,double>>> adj;
 	vector<pair<array<int,2>, double>> entries;
 
 	friend ostream& operator<<(ostream& os, QUBO const& q) {
@@ -75,13 +84,10 @@ struct QUBO {
 		return os;
 	}
 
-	double diff(int flip, vector<bool> const& solution) const {
-		double out=diag[flip];
-		for (auto [a,b]: adj[flip])
-			if (solution[a]) out+=b;
-		
-		return solution[flip] ? -out : out;
-	}
+	vector<float> diag_float;
+	vector<float> adj_float_d;
+	vector<int> adj_i;
+	vector<int> adj_j;
 };
 
 struct Settings {
@@ -120,20 +126,6 @@ struct State {
 		float energy=0, t=set.T_0;
 		int i=0;
 
-		vector<float> diag_float(qubo.diag.begin(), qubo.diag.end());
-		vector<int> adj_i;
-		vector<int> adj_j;
-		vector<double> adj_float_d;
-		for (int i=0; i<qubo.n; i++) {
-			adj_i.push_back(adj_j.size());
-			for (auto [a,b]: qubo.adj[i]) {
-				adj_j.push_back(a);
-				adj_float_d.push_back(b);
-			}
-		}
-
-		adj_i.push_back(adj_j.size());
-
 		int stop=set.stop_threshold, restart=set.restart_threshold;
 		bool ex=false;
 
@@ -143,8 +135,8 @@ struct State {
 
 		auto run = [
 				&set=set, n=qubo.n,
-				diag=diag_float.data(), adj_i=adj_i.data(),
-				adj_j=adj_j.data(), adj_d=adj_float_d.data(),
+				diag=qubo.diag_float.data(), adj_i=qubo.adj_i.data(),
+				adj_j=qubo.adj_j.data(), adj_d=qubo.adj_float_d.data(),
 				&thd,&t,&ex,&best,&restart,
 				&i,&energy,&stop,&tmp,&out,&orig
 			] (int thread_i) {
@@ -392,7 +384,7 @@ int main() {
 		.max_iter = 2000,
 		.nthread=int(p.threads.size()),
 		.synchronize_interval=10,
-		.stop_threshold=500, .restart_threshold=320,
+		.stop_threshold=600, .restart_threshold=320,
 		.T_0 = 50.0, .restart_mul=2.3, .alpha=1-1e-2,
 		.seed = rd()
 	};
@@ -450,16 +442,16 @@ int main() {
 
 	int w1=0, w2=0;
 	size_t my_its=0, ishan_its=0;
-	auto mark = bench(300, {[&](){
+	auto mark = bench(50, {[&](){
 		State state {.qubo=qubo, .set=set};
 		state.anneal(p);
 
 		if (state.val()-v>1e-3) w1++;
-		else if (state.val()<v-1e-3) cout<<"this is terrible, everything is wrong"<<endl;
+		else if (state.val()<v-1e-3) cout<<"this is terrible, everything is wrong - mine"<<endl;
 	}, [&]() {
 		double val = old::solve(parsed, p);
 		if (val-v>1e-3) w2++;
-		else if (val<v-1e-3) cout<<"this is terrible, everything is wrong"<<endl;
+		else if (val<v-1e-3) cout<<"this is terrible, everything is wrong - ishan"<<endl;
 	}});
 
 	cout<<"WA (1): "<<w1<<endl;
